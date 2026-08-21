@@ -13,6 +13,13 @@
       "icon": "😝",
       "color": "g-dotduel",
       "file": "games/dotduel.js"
+    },
+    {
+      "id": "quoridor",
+      "name": "quoridor",
+      "icon": "d",
+      "color": "g-quoridor",
+      "file": "games/quoridor.js"
     }
   ]
 }
