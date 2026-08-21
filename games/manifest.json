@@ -20,13 +20,6 @@
       "icon": "h",
       "color": "g-dots-and-boxes",
       "file": "games/dots-and-boxes.js"
-    },
-    {
-      "id": "gomoku",
-      "name": "Gomoku",
-      "icon": "a",
-      "color": "g-gomoku",
-      "file": "games/gomoku.js"
     }
   ]
 }
