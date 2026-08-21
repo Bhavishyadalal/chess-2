@@ -2049,7 +2049,7 @@ document.addEventListener('keydown', e => {
 });
 
 // ===================================================================
-// GAME: CHESS
+// GAME: CHESS (High-Performance Hardware-Accelerated Engine & Board)
 // ===================================================================
 (function () {
     const PIECE_SVG = {
@@ -2071,80 +2071,77 @@ document.addEventListener('keydown', e => {
     let selectedSquare = null, legalTargets = [], lastMoveSquares = [], premove = null;
     let boardFlipped = false, userFlippedManually = false;
     let moveHistoryForList = [], moveNumCounter = 0;
-    let playIntroAnim = false;
-    let animateSlideFlag = false; // set true right before render() when an actual move just happened
+    let slideAnim = null; // { fromDr, fromDc, toDr, toDc, piece, startTs, durationMs }
+    let animRafId = null;
 
-    function init(isHostOrLocal, resetState) {
-        if (resetState) { chess = new Chess(); moveHistoryForList = []; moveNumCounter = 0; playIntroAnim = true; }
-        selectedSquare = null; legalTargets = []; lastMoveSquares = []; premove = null;
-        rebuildMoveListUI();
-        render();
-        updateClockDisplay();
-        if (amHost && resetState && !localMode) gameSend({ kind: 'sync', fen: chess.fen() });
-    }
-    function isFlipped() { return userFlippedManually ? boardFlipped : (myColor === 'b'); }
-    function flip() {
-        const frame = document.getElementById('chess-board').closest('.board-frame');
-        if (frame) frame.classList.add('flipping');
-        boardFlipped = !boardFlipped; userFlippedManually = true;
-        setTimeout(() => {
-            render();
-            if (frame) requestAnimationFrame(() => frame.classList.remove('flipping'));
-        }, 160);
-    }
+    // ---- Hardware-Accelerated Piece Sprites ----
+    const pieceCanvases = {};
+    let piecesReady = false;
 
-    // ---- Canvas board rendering ----
-    // Pieces are rasterized from their SVG markup once into offscreen bitmaps,
-    // then drawn with drawImage each frame — this avoids re-parsing/re-laying-out
-    // SVG markup on every move, which was the actual mobile cost of the old
-    // DOM-based board. All game logic (onSquareClick, premoves, chess rules)
-    // is untouched below; only how the board is painted and how taps are
-    // translated into square coordinates has changed.
-    let pieceBitmaps = {}; // 'wp','bk', etc. -> HTMLImageElement, ready to drawImage
-    let bitmapsReady = false;
-    function rasterizePieceBitmaps() {
+    function rasterizePieceSprites() {
         const keys = Object.keys(PIECE_SVG);
         let loaded = 0;
+        const targetDpr = Math.min(window.devicePixelRatio || 1, 3);
+        const spriteSize = Math.round(128 * targetDpr);
+
         keys.forEach(k => {
             const img = new Image();
-            const svgBlob = new Blob([PIECE_SVG[k]], { type: 'image/svg+xml' });
-            const url = URL.createObjectURL(svgBlob);
-            img.onload = () => { URL.revokeObjectURL(url); loaded++; if (loaded === keys.length) { bitmapsReady = true; render(); } };
-            img.onerror = () => { loaded++; };
-            img.src = url;
-            pieceBitmaps[k] = img;
+            const svgData = 'data:image/svg+xml;utf8,' + encodeURIComponent(PIECE_SVG[k]);
+            img.onload = () => {
+                const off = document.createElement('canvas');
+                off.width = spriteSize;
+                off.height = spriteSize;
+                const octx = off.getContext('2d');
+                // Pre-bake soft shadow directly onto sprite (0 runtime shadow cost)
+                octx.shadowColor = 'rgba(0,0,0,0.42)';
+                octx.shadowBlur = 4 * targetDpr;
+                octx.shadowOffsetY = 3 * targetDpr;
+                octx.drawImage(img, 6 * targetDpr, 6 * targetDpr, spriteSize - 12 * targetDpr, spriteSize - 12 * targetDpr);
+                pieceCanvases[k] = off;
+                loaded++;
+                if (loaded === keys.length) {
+                    piecesReady = true;
+                    render();
+                }
+            };
+            img.src = svgData;
         });
     }
-    rasterizePieceBitmaps();
+    rasterizePieceSprites();
 
+    // ---- Canvas Setup & High-DPI Scaling ----
     let ctx = null, canvasSizeCss = 0, cellPx = 0, dpr = 1;
-    // Per-square transient animation state, keyed by screen-position "dr,dc".
-    let slideAnim = null; // { fromDr, fromDc, toDr, toDc, startTs, durationMs }
-    let introAnimStart = null; // timestamp when the new-game intro animation began
-    const INTRO_DURATION = 480; // covers the staggered per-piece delays + each piece's own pop-in
+    let canvasEl = null;
 
     function ensureCanvasSetup() {
-        const canvas = document.getElementById('chess-board');
-        const cssSize = canvas.clientWidth || canvas.getBoundingClientRect().width;
-        const newDpr = window.devicePixelRatio || 1;
-        if (canvas.width !== Math.round(cssSize * newDpr) || !ctx) {
+        if (!canvasEl) canvasEl = document.getElementById('chess-board');
+        if (!canvasEl) return false;
+        const rect = canvasEl.getBoundingClientRect();
+        const cssSize = rect.width || canvasEl.clientWidth || 360;
+        const newDpr = Math.min(window.devicePixelRatio || 1, 3);
+
+        if (canvasEl.width !== Math.round(cssSize * newDpr) || !ctx || canvasSizeCss !== cssSize) {
             dpr = newDpr;
             canvasSizeCss = cssSize;
-            canvas.width = Math.round(cssSize * dpr);
-            canvas.height = Math.round(cssSize * dpr);
-            ctx = canvas.getContext('2d');
+            canvasEl.width = Math.round(cssSize * dpr);
+            canvasEl.height = Math.round(cssSize * dpr);
+            ctx = canvasEl.getContext('2d', { alpha: false });
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
             cellPx = cssSize / 8;
-            bindCanvasInput(canvas);
+            bindCanvasInput(canvasEl);
         }
-        return canvas;
+        return true;
     }
 
     let inputBound = false;
     function bindCanvasInput(canvas) {
-        if (inputBound) return;
+        if (inputBound || !canvas) return;
         inputBound = true;
-        canvas.addEventListener('click', (e) => {
+
+        const handlePointer = (e) => {
+            if (e.pointerType === 'touch') e.preventDefault();
             const rect = canvas.getBoundingClientRect();
             const x = e.clientX - rect.left, y = e.clientY - rect.top;
             const dc = Math.floor(x / cellPx), dr = Math.floor(y / cellPx);
@@ -2154,197 +2151,214 @@ document.addEventListener('keydown', e => {
             const fileIdx = flipped ? 7 - dc : dc;
             const square = FILES[fileIdx] + (8 - rankIdx);
             onSquareClick(square);
+        };
+
+        canvas.addEventListener('pointerdown', handlePointer, { passive: false });
+    }
+
+    // Auto resize watcher
+    if (typeof ResizeObserver !== 'undefined') {
+        const ro = new ResizeObserver(() => {
+            if (document.getElementById('stage-chess') && !document.getElementById('stage-chess').classList.contains('hidden')) {
+                ensureCanvasSetup();
+                render();
+            }
+        });
+        window.addEventListener('DOMContentLoaded', () => {
+            const boardEl = document.getElementById('chess-board');
+            if (boardEl) ro.observe(boardEl);
         });
     }
 
     function init(isHostOrLocal, resetState) {
-        if (resetState) { chess = new Chess(); moveHistoryForList = []; moveNumCounter = 0; playIntroAnim = true; }
-        selectedSquare = null; legalTargets = []; lastMoveSquares = []; premove = null;
+        if (resetState) {
+            chess = new Chess();
+            moveHistoryForList = [];
+            moveNumCounter = 0;
+            slideAnim = null;
+        }
+        selectedSquare = null;
+        legalTargets = [];
+        lastMoveSquares = [];
+        premove = null;
         rebuildMoveListUI();
         render();
         updateClockDisplay();
         if (amHost && resetState && !localMode) gameSend({ kind: 'sync', fen: chess.fen() });
     }
-    function isFlipped() { return userFlippedManually ? boardFlipped : (myColor === 'b'); }
+
+    function isFlipped() {
+        return userFlippedManually ? boardFlipped : (myColor === 'b');
+    }
+
     function flip() {
         const frame = document.getElementById('chess-board').closest('.board-frame');
         if (frame) frame.classList.add('flipping');
-        boardFlipped = !boardFlipped; userFlippedManually = true;
+        boardFlipped = !boardFlipped;
+        userFlippedManually = true;
         setTimeout(() => {
             render();
             if (frame) requestAnimationFrame(() => frame.classList.remove('flipping'));
-        }, 160);
+        }, 120);
     }
 
-    let cachedInfoColor = null, cachedMonoFont = null;
-    function getCachedStyles() {
-        if (cachedInfoColor == null) {
-            const cs = getComputedStyle(document.documentElement);
-            cachedInfoColor = cs.getPropertyValue('--info').trim() || '#6fa8dc';
-            cachedMonoFont = cs.getPropertyValue('--font-mono').trim() || 'monospace';
-        }
-    }
-    function drawSquareBase(dr, dc, rankIdx, fileIdx, square, kingSq) {
-        const x = dc * cellPx, y = dr * cellPx;
-        const isLight = (rankIdx + fileIdx) % 2 === 0;
-        ctx.fillStyle = isLight ? '#ebedd0' : '#779556';
-        ctx.fillRect(x, y, cellPx, cellPx);
-
-        if (lastMoveSquares.includes(square)) {
-            ctx.fillStyle = isLight ? 'rgba(246,235,109,0.48)' : 'rgba(200,181,63,0.48)';
-            ctx.fillRect(x, y, cellPx, cellPx);
-        }
-        if (square === selectedSquare) {
-            ctx.fillStyle = 'rgba(255,246,120,0.48)';
-            ctx.fillRect(x, y, cellPx, cellPx);
-        }
-        if (square === kingSq) {
-            const grad = ctx.createRadialGradient(x + cellPx / 2, y + cellPx / 2, 0, x + cellPx / 2, y + cellPx / 2, cellPx * 0.6);
-            grad.addColorStop(0, 'rgba(232,60,60,0.88)');
-            grad.addColorStop(1, 'rgba(232,60,60,0)');
-            ctx.fillStyle = grad;
-            ctx.fillRect(x, y, cellPx, cellPx);
-        }
-        if (premove && (square === premove.from || square === premove.to)) {
-            ctx.save();
-            ctx.strokeStyle = cachedInfoColor;
-            ctx.lineWidth = 3;
-            ctx.strokeRect(x + 1.5, y + 1.5, cellPx - 3, cellPx - 3);
-            ctx.restore();
-        }
-        // Coordinate labels on the edge ranks/files.
-        ctx.font = '700 9px ' + cachedMonoFont;
-        ctx.globalAlpha = 0.55;
-        ctx.fillStyle = isLight ? '#779556' : '#ebedd0';
-        if (dc === 0) { ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillText(8 - rankIdx, x + 3, y + 2); }
-        if (dr === 7) { ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'; ctx.fillText(FILES[fileIdx], x + cellPx - 3, y + cellPx - 2); }
-        ctx.globalAlpha = 1;
+    function easeOutCubic(t) {
+        return 1 - Math.pow(1 - t, 3);
     }
 
-    function drawMarker(dr, dc, hasPiece) {
-        const x = dc * cellPx, y = dr * cellPx, cx = x + cellPx / 2, cy = y + cellPx / 2;
-        ctx.fillStyle = 'rgba(20,20,20,0.22)';
-        ctx.strokeStyle = 'rgba(20,20,20,0.22)';
-        if (hasPiece) {
-            ctx.lineWidth = 4;
-            ctx.beginPath(); ctx.arc(cx, cy, cellPx * 0.45, 0, Math.PI * 2); ctx.stroke();
-        } else {
-            ctx.beginPath(); ctx.arc(cx, cy, cellPx * 0.13, 0, Math.PI * 2); ctx.fill();
-        }
-    }
+    function paintFrame() {
+        if (!ctx || !ensureCanvasSetup()) return;
 
-    function render() {
-        ensureCanvasSetup();
-        if (!ctx) return;
         const board = chess.board();
         const flipped = isFlipped();
         const inCheck = chess.inCheck();
         const kingSq = inCheck ? findKingSquare(chess.turn()) : null;
-        const doIntro = playIntroAnim; playIntroAnim = false;
-        const doSlide = animateSlideFlag; animateSlideFlag = false;
-        const screenPos = {}; // square -> {dr, dc}, used to resolve slide/intro animation origins
 
-        if (doIntro) introAnimStart = performance.now();
-        let slideFrom = null, slideTo = null, slidePiece = null;
-
-        for (let dr = 0; dr < 8; dr++) {
-            for (let dc = 0; dc < 8; dc++) {
-                const rankIdx = flipped ? 7 - dr : dr;
-                const fileIdx = flipped ? 7 - dc : dc;
-                const square = FILES[fileIdx] + (8 - rankIdx);
-                screenPos[square] = { dr, dc };
-                if (doSlide && lastMoveSquares.length === 2 && square === lastMoveSquares[1]) {
-                    slideTo = { dr, dc }; slidePiece = board[rankIdx][fileIdx];
-                }
-                if (doSlide && lastMoveSquares.length === 2 && square === lastMoveSquares[0]) {
-                    slideFrom = { dr, dc };
-                }
-            }
-        }
-        if (slideFrom && slideTo && slidePiece) {
-            slideAnim = { fromDr: slideFrom.dr, fromDc: slideFrom.dc, toDr: slideTo.dr, toDc: slideTo.dc, piece: slidePiece, startTs: performance.now(), durationMs: 220 };
+        // Precompute quick lookups
+        const lastMoveSet = new Set(lastMoveSquares);
+        const targetMap = new Map();
+        for (let i = 0; i < legalTargets.length; i++) {
+            targetMap.set(legalTargets[i].to, legalTargets[i]);
         }
 
-        paintFrame(board, flipped, kingSq);
-
-        // Drive any in-flight animation (slide-in move, or staggered new-game intro).
-        if (slideAnim || (introAnimStart != null && performance.now() - introAnimStart < INTRO_DURATION)) {
-            requestAnimationFrame(() => paintFrame(chess.board(), isFlipped(), inCheck ? findKingSquare(chess.turn()) : null));
-        }
-    }
-
-    function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
-    function easeOutBack(t) { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); }
-
-    function paintFrame(board, flipped, kingSq) {
-        if (!ctx) return;
-        getCachedStyles();
-        ctx.clearRect(0, 0, canvasSizeCss, canvasSizeCss);
-
+        // Animation progress calculation
         let slideProgress = null;
         if (slideAnim) {
-            const t = Math.min(1, (performance.now() - slideAnim.startTs) / slideAnim.durationMs);
+            const elapsed = performance.now() - slideAnim.startTs;
+            const t = Math.min(1, elapsed / slideAnim.durationMs);
             slideProgress = easeOutCubic(t);
             if (t >= 1) slideAnim = null;
         }
-        const introElapsed = introAnimStart != null ? performance.now() - introAnimStart : Infinity;
 
+        // 1. Draw 64 Squares (Batch Base)
         for (let dr = 0; dr < 8; dr++) {
             for (let dc = 0; dc < 8; dc++) {
                 const rankIdx = flipped ? 7 - dr : dr;
                 const fileIdx = flipped ? 7 - dc : dc;
-                const piece = board[rankIdx][fileIdx];
                 const square = FILES[fileIdx] + (8 - rankIdx);
-                drawSquareBase(dr, dc, rankIdx, fileIdx, square, kingSq);
-                const target = legalTargets.find(t => t.to === square);
-                if (target) drawMarker(dr, dc, !!piece);
+                const isLight = (rankIdx + fileIdx) % 2 === 0;
+                const x = dc * cellPx, y = dr * cellPx;
+
+                ctx.fillStyle = isLight ? '#ebedd0' : '#779556';
+                ctx.fillRect(x, y, cellPx, cellPx);
+
+                if (lastMoveSet.has(square)) {
+                    ctx.fillStyle = isLight ? 'rgba(246,235,109,0.5)' : 'rgba(200,181,63,0.5)';
+                    ctx.fillRect(x, y, cellPx, cellPx);
+                }
+                if (square === selectedSquare) {
+                    ctx.fillStyle = 'rgba(255,246,120,0.55)';
+                    ctx.fillRect(x, y, cellPx, cellPx);
+                }
+                if (square === kingSq) {
+                    const grad = ctx.createRadialGradient(x + cellPx / 2, y + cellPx / 2, 0, x + cellPx / 2, y + cellPx / 2, cellPx * 0.6);
+                    grad.addColorStop(0, 'rgba(235,55,55,0.9)');
+                    grad.addColorStop(1, 'rgba(235,55,55,0)');
+                    ctx.fillStyle = grad;
+                    ctx.fillRect(x, y, cellPx, cellPx);
+                }
+                if (premove && (square === premove.from || square === premove.to)) {
+                    ctx.strokeStyle = '#6fa8dc';
+                    ctx.lineWidth = 3;
+                    ctx.strokeRect(x + 1.5, y + 1.5, cellPx - 3, cellPx - 3);
+                }
             }
         }
-        // Pieces drawn in a second pass so slide/intro animations aren't
-        // clipped by a neighboring square's fill.
+
+        // 2. Draw Coordinates on Edges (Set Font ONCE)
+        ctx.font = '700 9px monospace';
+        for (let dr = 0; dr < 8; dr++) {
+            const rankIdx = flipped ? 7 - dr : dr;
+            const isLight = (rankIdx + (flipped ? 7 : 0)) % 2 === 0;
+            ctx.fillStyle = isLight ? '#779556' : '#ebedd0';
+            ctx.fillText(8 - rankIdx, 3, dr * cellPx + 11);
+        }
+        for (let dc = 0; dc < 8; dc++) {
+            const fileIdx = flipped ? 7 - dc : dc;
+            const isLight = ((flipped ? 0 : 7) + fileIdx) % 2 === 0;
+            ctx.fillStyle = isLight ? '#779556' : '#ebedd0';
+            ctx.fillText(FILES[fileIdx], (dc + 1) * cellPx - 9, 8 * cellPx - 3);
+        }
+
+        // 3. Draw Legal Move Markers
+        for (let dr = 0; dr < 8; dr++) {
+            for (let dc = 0; dc < 8; dc++) {
+                const rankIdx = flipped ? 7 - dr : dr;
+                const fileIdx = flipped ? 7 - dc : dc;
+                const square = FILES[fileIdx] + (8 - rankIdx);
+                const target = targetMap.get(square);
+                if (target) {
+                    const cx = dc * cellPx + cellPx / 2, cy = dr * cellPx + cellPx / 2;
+                    const hasPiece = !!board[rankIdx][fileIdx];
+                    ctx.fillStyle = 'rgba(18,22,28,0.24)';
+                    ctx.strokeStyle = 'rgba(18,22,28,0.24)';
+                    if (hasPiece) {
+                        ctx.lineWidth = 4;
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, cellPx * 0.44, 0, Math.PI * 2);
+                        ctx.stroke();
+                    } else {
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, cellPx * 0.14, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+            }
+        }
+
+        // 4. Draw Hardware-Accelerated Piece Bitmaps
+        const pieceSize = cellPx * 0.88;
+        const pieceOffset = (cellPx - pieceSize) / 2;
+
         for (let dr = 0; dr < 8; dr++) {
             for (let dc = 0; dc < 8; dc++) {
                 const rankIdx = flipped ? 7 - dr : dr;
                 const fileIdx = flipped ? 7 - dc : dc;
                 const piece = board[rankIdx][fileIdx];
                 if (!piece) continue;
-                const square = FILES[fileIdx] + (8 - rankIdx);
 
-                const cellIdx = dr * 8 + dc;
-                let opacity = 1, scale = 1, drawDr = dr, drawDc = dc;
+                const key = piece.color + piece.type;
+                const sprite = pieceCanvases[key];
+                if (!sprite) continue;
 
-                if (slideAnim && dr === slideAnim.toDr && dc === slideAnim.toDc && slideProgress != null) {
-                    drawDr = slideAnim.fromDr + (slideAnim.toDr - slideAnim.fromDr) * slideProgress;
-                    drawDc = slideAnim.fromDc + (slideAnim.toDc - slideAnim.fromDc) * slideProgress;
-                } else if (introElapsed < INTRO_DURATION) {
-                    const delay = cellIdx * 6;
-                    const local = Math.max(0, Math.min(1, (introElapsed - delay) / 360));
-                    if (local <= 0) continue; // not yet appeared
-                    opacity = local; scale = 0.3 + 0.7 * easeOutBack(local);
+                let drawX = dc * cellPx + pieceOffset;
+                let drawY = dr * cellPx + pieceOffset;
+
+                // Handle smooth slide interpolation
+                if (slideAnim && slideProgress != null && dr === slideAnim.toDr && dc === slideAnim.toDc) {
+                    const fromX = slideAnim.fromDc * cellPx + pieceOffset;
+                    const fromY = slideAnim.fromDr * cellPx + pieceOffset;
+                    drawX = fromX + (drawX - fromX) * slideProgress;
+                    drawY = fromY + (drawY - fromY) * slideProgress;
                 }
-                drawPieceAt(drawDr, drawDc, piece, opacity, scale);
+
+                ctx.drawImage(sprite, drawX, drawY, pieceSize, pieceSize);
             }
         }
+
+        // Continue animation loop if still in flight
+        if (slideAnim) {
+            animRafId = requestAnimationFrame(paintFrame);
+        } else {
+            animRafId = null;
+        }
     }
-    function drawPieceAt(dr, dc, piece, opacity, scale) {
-        const bmp = pieceBitmaps[piece.color + piece.type];
-        if (!bmp || !bmp.complete || bmp.naturalWidth === 0) return;
-        const size = cellPx * 0.84 * (scale == null ? 1 : scale);
-        const x = dc * cellPx + (cellPx - size) / 2;
-        const y = dr * cellPx + (cellPx - size) / 2;
-        ctx.save();
-        if (opacity != null) ctx.globalAlpha = opacity;
-        ctx.shadowColor = 'rgba(0,0,0,0.45)';
-        ctx.shadowBlur = 4;
-        ctx.shadowOffsetY = 3;
-        ctx.drawImage(bmp, x, y, size, size);
-        ctx.restore();
+
+    function render() {
+        if (animRafId) {
+            cancelAnimationFrame(animRafId);
+            animRafId = null;
+        }
+        paintFrame();
     }
+
     function findKingSquare(color) {
         const board = chess.board();
-        for (let r = 0; r < 8; r++) for (let f = 0; f < 8; f++) {
-            const p = board[r][f];
-            if (p && p.type === 'k' && p.color === color) return p.square;
+        for (let r = 0; r < 8; r++) {
+            for (let f = 0; f < 8; f++) {
+                const p = board[r][f];
+                if (p && p.type === 'k' && p.color === color) return p.square;
+            }
         }
         return null;
     }
@@ -2354,7 +2368,7 @@ document.addEventListener('keydown', e => {
         const isMyTurn = localMode ? true : (chess.turn() === myColor);
         const piece = chess.get(square);
 
-        // ---- Premove staging (only meaningful online, when it's not my turn) ----
+        // Premove staging
         if (!isMyTurn && !localMode) {
             if (selectedSquare) {
                 if (square === selectedSquare) { selectedSquare = null; legalTargets = []; render(); return; }
@@ -2378,10 +2392,10 @@ document.addEventListener('keydown', e => {
             if (target) {
                 if (target.promotion) showPromoChoice(selectedSquare, square);
                 else makeLocalMove(selectedSquare, square, null);
-                selectedSquare = null; legalTargets = []; render();
+                selectedSquare = null; legalTargets = [];
                 return;
             }
-            if (piece && ((isMyTurn && piece.color === chess.turn()))) {
+            if (piece && isMyTurn && piece.color === chess.turn()) {
                 selectedSquare = square;
                 legalTargets = chess.moves({ square, verbose: true });
                 render();
@@ -2390,16 +2404,13 @@ document.addEventListener('keydown', e => {
             selectedSquare = null; legalTargets = []; render();
             return;
         }
-        if (!piece) return;
-        if (piece.color !== chess.turn()) return;
+
+        if (!piece || piece.color !== chess.turn()) return;
         selectedSquare = square;
         legalTargets = chess.moves({ square, verbose: true });
         render();
     }
 
-    // A lightweight, non-authoritative move-shape check used only to decide
-    // which squares to highlight while staging a premove — the real legality
-    // check happens against the live board once the premove is actually played.
     function premoveTargetsFrom(square) {
         const piece = chess.get(square);
         if (!piece) return [];
@@ -2414,7 +2425,7 @@ document.addEventListener('keydown', e => {
             const dirs = piece.type === 'b' ? [[1,1],[1,-1],[-1,1],[-1,-1]]
                 : piece.type === 'r' ? [[1,0],[-1,0],[0,1],[0,-1]]
                 : piece.type === 'q' ? [[1,1],[1,-1],[-1,1],[-1,-1],[1,0],[-1,0],[0,1],[0,-1]]
-                : [[0, piece.color === 'w' ? 1 : -1]]; // pawn: forward only (simplified)
+                : [[0, piece.color === 'w' ? 1 : -1]];
             for (const [df, dr] of dirs) {
                 let f = f0 + df, r = r0 + dr, steps = 0;
                 const maxSteps = piece.type === 'p' ? 2 : 8;
@@ -2423,11 +2434,12 @@ document.addEventListener('keydown', e => {
         }
         return targets;
     }
+
     function setPremove(from, to) {
         const piece = chess.get(from);
         const promotion = piece && piece.type === 'p' && (to[1] === '8' || to[1] === '1') ? 'q' : undefined;
         premove = { from, to, promotion };
-        toast('Premove set — it\u2019ll play automatically on your turn.');
+        toast('Premove set');
         render();
     }
 
@@ -2445,7 +2457,22 @@ document.addEventListener('keydown', e => {
         overlay.classList.remove('hidden');
     }
 
+    function triggerSlideAnim(from, to, piece) {
+        const flipped = isFlipped();
+        const f0 = FILES.indexOf(from[0]), r0 = parseInt(from[1], 10) - 1;
+        const f1 = FILES.indexOf(to[0]), r1 = parseInt(to[1], 10) - 1;
+        const fromDr = flipped ? r0 : 7 - r0, fromDc = flipped ? 7 - f0 : f0;
+        const toDr = flipped ? r1 : 7 - r1, toDc = flipped ? 7 - f1 : f1;
+
+        slideAnim = {
+            fromDr, fromDc, toDr, toDc, piece,
+            startTs: performance.now(),
+            durationMs: 160
+        };
+    }
+
     function makeLocalMove(from, to, promotion) {
+        const piece = chess.get(from);
         const result = chess.move({ from, to, promotion: promotion || undefined });
         if (!result) return;
         lastMoveSquares = [from, to];
@@ -2454,60 +2481,92 @@ document.addEventListener('keydown', e => {
         appendMoveToList(result);
         playMoveSound(result);
         if (localMode) { myColor = chess.turn(); updateAvatars(); }
-        animateSlideFlag = true;
+
+        triggerSlideAnim(from, to, piece);
         render();
         updateClockDisplay();
         updateActionButtons();
         checkGameEnd();
         setStatusLine();
     }
+
     function makeLocalMoveFromPremove(result) {
         lastMoveSquares = [result.from, result.to];
         gameSend({ kind: 'move', from: result.from, to: result.to, promotion: result.promotion || null });
         appendMoveToList(result);
         playMoveSound(result);
-        animateSlideFlag = true;
-        render(); updateClockDisplay(); updateActionButtons(); checkGameEnd(); setStatusLine();
+        triggerSlideAnim(result.from, result.to, result);
+        render();
+        updateClockDisplay();
+        updateActionButtons();
+        checkGameEnd();
+        setStatusLine();
     }
+
     function applyRemoteMove(from, to, promotion) {
+        const piece = chess.get(from);
         const result = chess.move({ from, to, promotion: promotion || undefined });
         if (!result) return;
         lastMoveSquares = [from, to];
         if (incrementMs) { if (result.color === 'w') whiteMs += incrementMs; else blackMs += incrementMs; }
         appendMoveToList(result);
         playMoveSound(result);
-        animateSlideFlag = true;
-        render(); updateClockDisplay(); updateActionButtons(); checkGameEnd(); setStatusLine();
+
+        triggerSlideAnim(from, to, piece);
+        render();
+        updateClockDisplay();
+        updateActionButtons();
+        checkGameEnd();
+        setStatusLine();
+
         if (premove && !localMode && !gameEnded && chess.turn() === myColor) {
             const pm = premove; premove = null;
-            setTimeout(() => { const r = chess.move({ from: pm.from, to: pm.to, promotion: pm.promotion || undefined }); if (r) makeLocalMoveFromPremove(r); else toast('Premove was no longer legal.'); render(); }, 150);
+            setTimeout(() => {
+                const r = chess.move({ from: pm.from, to: pm.to, promotion: pm.promotion || undefined });
+                if (r) makeLocalMoveFromPremove(r);
+                else toast('Premove was no longer legal.');
+                render();
+            }, 120);
         }
     }
+
     function playMoveSound(result) {
         if (chess.inCheck() && !chess.isCheckmate()) sndCheck();
         else if (result.captured) sndCapture();
         else sndMove();
     }
+
     function appendMoveToList(result) {
         moveHistoryForList.push(result);
         const list = document.getElementById('move-list');
-        const empty = list.querySelector('.move-empty'); if (empty) empty.remove();
+        const empty = list.querySelector('.move-empty');
+        if (empty) empty.remove();
         if (result.color === 'w') {
             moveNumCounter++;
-            const num = document.createElement('span'); num.className = 'move-num'; num.innerText = moveNumCounter + '.';
+            const num = document.createElement('span');
+            num.className = 'move-num';
+            num.innerText = moveNumCounter + '.';
             list.appendChild(num);
         }
-        const entry = document.createElement('span'); entry.className = 'move-entry'; entry.innerText = result.san;
+        const entry = document.createElement('span');
+        entry.className = 'move-entry';
+        entry.innerText = result.san;
         list.appendChild(entry);
         list.scrollTop = list.scrollHeight;
         document.getElementById('move-count-badge').innerText = moveHistoryForList.length + (moveHistoryForList.length === 1 ? ' ply' : ' plies');
     }
+
     function rebuildMoveListUI() {
         const list = document.getElementById('move-list');
         list.innerHTML = '';
         moveNumCounter = 0;
-        if (moveHistoryForList.length === 0) { list.innerHTML = '<div class="move-empty">No moves yet</div>'; }
-        else { const hist = [...moveHistoryForList]; moveHistoryForList = []; hist.forEach(m => appendMoveToList(m)); }
+        if (moveHistoryForList.length === 0) {
+            list.innerHTML = '<div class="move-empty">No moves yet</div>';
+        } else {
+            const hist = [...moveHistoryForList];
+            moveHistoryForList = [];
+            hist.forEach(m => appendMoveToList(m));
+        }
         document.getElementById('move-count-badge').innerText = moveHistoryForList.length + (moveHistoryForList.length === 1 ? ' ply' : ' plies');
     }
 
@@ -2528,12 +2587,21 @@ document.addEventListener('keydown', e => {
         const undone = chess.undo();
         if (!undone) return;
         moveHistoryForList.pop();
-        if (incrementMs) { if (undone.color === 'w') whiteMs = Math.max(0, whiteMs - incrementMs); else blackMs = Math.max(0, blackMs - incrementMs); }
+        if (incrementMs) {
+            if (undone.color === 'w') whiteMs = Math.max(0, whiteMs - incrementMs);
+            else blackMs = Math.max(0, blackMs - incrementMs);
+        }
         rebuildMoveListUI();
-        selectedSquare = null; legalTargets = []; premove = null;
+        selectedSquare = null;
+        legalTargets = [];
+        premove = null;
         lastMoveSquares = moveHistoryForList.length ? [moveHistoryForList[moveHistoryForList.length-1].from, moveHistoryForList[moveHistoryForList.length-1].to] : [];
+        slideAnim = null;
         gameEnded = false;
-        render(); setStatusLine(); updateClockDisplay(); updateActionButtons();
+        render();
+        setStatusLine();
+        updateClockDisplay();
+        updateActionButtons();
         startClockIfNeeded();
     }
 
