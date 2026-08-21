@@ -20,6 +20,13 @@
       "icon": "d",
       "color": "g-quoridor",
       "file": "games/quoridor.js"
+    },
+    {
+      "id": "gomoku",
+      "name": "Gomoku",
+      "icon": "s",
+      "color": "g-gomoku",
+      "file": "games/gomoku.js"
     }
   ]
 }
