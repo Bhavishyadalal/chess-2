@@ -13,13 +13,6 @@
       "icon": "😝",
       "color": "g-dotduel",
       "file": "games/dotduel.js"
-    },
-    {
-      "id": "dots-and-boxes",
-      "name": "h",
-      "icon": "h",
-      "color": "g-dots-and-boxes",
-      "file": "games/dots-and-boxes.js"
     }
   ]
 }
