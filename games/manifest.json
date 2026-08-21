@@ -1,0 +1,11 @@
+{
+  "games": [
+    {
+      "id": "nim",
+      "name": "Nim",
+      "icon": "😜",
+      "color": "g-nim",
+      "file": "games/nim.js"
+    }
+  ]
+}
