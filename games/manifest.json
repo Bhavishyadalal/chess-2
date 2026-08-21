@@ -6,6 +6,13 @@
       "icon": "😜",
       "color": "g-nim",
       "file": "games/nim.js"
+    },
+    {
+      "id": "dotduel",
+      "name": "Dotduel",
+      "icon": "😝",
+      "color": "g-dotduel",
+      "file": "games/dotduel.js"
     }
   ]
 }
